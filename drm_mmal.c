@@ -206,6 +206,37 @@ uint32_t mmal_encoding_to_drm_fourcc(uint32_t mmal_encoding)
    }
 }
 
+void mmal_format_to_drm_pitches_offsets(uint32_t *pitches, uint32_t *offsets, uint32_t *bo_handles, MMAL_ES_FORMAT_T *format)
+{
+   switch (format->encoding)
+   {
+      // 3 plane YUV formats
+      case MMAL_ENCODING_I420:
+         pitches[0] = mmal_encoding_width_to_stride(format->encoding, format->es->video.width);
+         pitches[1] = pitches[0] / 2;
+         pitches[2] = pitches[1];
+
+         offsets[1] = pitches[0] * format->es->video.height;
+         offsets[2] = offsets[1] + pitches[1] * format->es->video.height/2;
+
+         bo_handles[1] = bo_handles[2] = bo_handles[0];
+         break;
+      // 2 plane YUV formats
+      case MMAL_ENCODING_NV12:
+      case MMAL_ENCODING_NV21:
+         pitches[0] = mmal_encoding_width_to_stride(format->encoding, format->es->video.width);
+         pitches[1] = pitches[0];
+
+         offsets[1] = pitches[0] * format->es->video.height;
+
+         bo_handles[1] = bo_handles[0];
+         break;
+      default:
+         pitches[0] = mmal_encoding_width_to_stride(format->encoding, format->es->video.width);
+         break;
+   }
+}
+
 static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
 {
    struct drm_mode_create_dumb gem;
@@ -240,9 +271,11 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
    b->dbuf_fd = prime.fd;
 
    uint32_t offsets[4] = { 0 };
-   uint32_t pitches[4] = { mmal_encoding_width_to_stride(port->format->encoding, port->format->es->video.width) };
+   uint32_t pitches[4] = { 0 };
    uint32_t bo_handles[4] = { b->bo_handle };
    unsigned int fourcc = mmal_encoding_to_drm_fourcc(port->format->encoding);
+
+   mmal_format_to_drm_pitches_offsets(pitches, offsets, bo_handles, port->format);
 
    fprintf(stderr, "FB fourcc %c%c%c%c\n",
       fourcc,
@@ -609,7 +642,7 @@ int main(int argc, char **argv)
    CHECK_STATUS(status, "failed to commit format");
 
    MMAL_ES_FORMAT_T *format_out = decoder->output[0]->format;
-   format_out->encoding = MMAL_ENCODING_RGB16;
+   format_out->encoding = MMAL_ENCODING_I420;
    setup.out_fourcc = mmal_encoding_to_drm_fourcc(decoder->output[0]->format->encoding);
    status = mmal_port_format_commit(decoder->output[0]);
    CHECK_STATUS(status, "failed to commit format");
