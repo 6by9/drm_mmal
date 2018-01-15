@@ -63,7 +63,6 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "interface/mmal/util/mmal_connection.h"
 #include "interface/mmal/mmal_queue.h"
 #include "interface/vcos/vcos.h"
-#include <stdio.h>
 
 //Tested working:
 //MMAL_ENCODING_I420 (YU12)
@@ -291,11 +290,13 @@ void mmal_format_to_drm_pitches_offsets(uint32_t *pitches, uint32_t *offsets, ui
             );
 }
 
+#define VCSM_IMPORT 0
 static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
 {
+   int ret;
+#if VCSM_IMPORT
    struct drm_mode_create_dumb gem;
    struct drm_mode_destroy_dumb gem_destroy;
-   int ret;
 
    memset(&gem, 0, sizeof gem);
    gem.width = port->format->es->video.width;
@@ -324,6 +325,38 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
    printf("dbuf_fd = %d\n", prime.fd);
    b->dbuf_fd = prime.fd;
 
+   b->vcsm_handle = vcsm_import_dmabuf(b->dbuf_fd, "DRM Buf");
+   printf("vcsm_handle is %u\n", b->vcsm_handle);
+   if (!b->vcsm_handle)
+      goto fail_prime;
+
+#else
+   b->vcsm_handle = vcsm_malloc(port->buffer_size, "MMAL Buf");
+   if (!b->vcsm_handle)
+      return -1;
+
+   b->dbuf_fd = vcsm_export_dmabuf(b->vcsm_handle);
+   if (b->dbuf_fd < 0)
+   {
+      vcsm_free(b->vcsm_handle);
+      return -1;
+   }
+
+   struct drm_prime_handle prime;
+   memset(&prime, 0, sizeof prime);
+   prime.fd = b->dbuf_fd;
+
+   ret = ioctl(drmfd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &prime);
+   if (ret)
+   {
+      printf("PRIME_HANDLE_TO_FD failed: %s\n", ERRSTR);
+      goto fail_gem;
+   }
+   b->bo_handle = prime.handle;
+   printf("Given bo_handle of %u\n", b->bo_handle);
+
+#endif
+
    uint32_t offsets[4] = { 0 };
    uint32_t pitches[4] = { 0 };
    uint32_t bo_handles[4] = { b->bo_handle };
@@ -337,10 +370,6 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
       fourcc >> 16,
       fourcc >> 24);
 
-   b->vcsm_handle = vcsm_import_dmabuf(b->dbuf_fd, "DRM Buf");
-   if (!b->vcsm_handle)
-      goto fail_prime;
-
    ret = drmModeAddFB2(drmfd, port->format->es->video.crop.width,
       port->format->es->video.crop.height, fourcc, bo_handles,
       pitches, offsets, &b->fb_handle, 0);
@@ -353,12 +382,16 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
    return 0;
 
 fail_vcsm:
+   printf("failed: - release vcsm handle\n");
+
    vcsm_free(b->vcsm_handle);
 
 fail_prime:
+   printf("failed: - close dmabuf_fd %d\n", b->dbuf_fd);
    close(b->dbuf_fd);
 
 fail_gem:
+#if VCSM_IMPORT
    memset(&gem_destroy, 0, sizeof gem_destroy);
    gem_destroy.handle = b->bo_handle,
    ret = ioctl(drmfd, DRM_IOCTL_MODE_DESTROY_DUMB, &gem_destroy);
@@ -366,7 +399,7 @@ fail_gem:
    {
       printf("DESTROY_DUMB failed: %s\n", ERRSTR);
    }
-
+#endif
    return -1;
 }
 
@@ -394,6 +427,7 @@ MMAL_POOL_T* pool_create_drm(MMAL_PORT_T *port, struct buffer *buffers, int drmf
 
 void buffer_destroy(int drmfd, struct buffer *buf)
 {
+#if VCSM_IMPORT
    struct drm_mode_destroy_dumb gem_destroy;
 
    vcsm_free(buf->vcsm_handle);
@@ -403,6 +437,19 @@ void buffer_destroy(int drmfd, struct buffer *buf)
    memset(&gem_destroy, 0, sizeof gem_destroy);
    gem_destroy.handle = buf->bo_handle;
    ioctl(drmfd, DRM_IOCTL_MODE_DESTROY_DUMB, &gem_destroy);
+#else
+   drmModeRmFB(drmfd, buf->fb_handle);
+
+   struct drm_gem_close arg = { buf->bo_handle, };
+   int ret;
+   printf("DRM_IOCTL_GEM_CLOSE on %u\n", buf->bo_handle);
+   ret = drmIoctl (drmfd, DRM_IOCTL_GEM_CLOSE, &arg);
+   printf("returned %d\n", ret);
+
+   vcsm_free(buf->vcsm_handle);
+
+   close(buf->dbuf_fd);
+#endif
 }
 
 void pool_destroy_drm(MMAL_PORT_T *port, MMAL_POOL_T *pool, struct buffer *buffers, int drmfd)
@@ -672,7 +719,7 @@ int main(int argc, char **argv)
    MMAL_POOL_T *pool_in = NULL, *pool_out = NULL;
    MMAL_BOOL_T eos_sent = MMAL_FALSE, eos_received = MMAL_FALSE;
    struct drm_setup setup = {0};
-   struct buffer buffers[MAX_BUFFERS];
+   struct buffer buffers[MAX_BUFFERS] = {0};
    MMAL_BUFFER_HEADER_T *current_buffer = NULL;
    MMAL_CONNECTION_T *connection = NULL;
    unsigned int in_count = 0, conn_out_count = 0, conn_in_count = 0, out_count = 0;
@@ -711,8 +758,8 @@ int main(int argc, char **argv)
    CHECK_STATUS(status, "failed to enable control port");
 
    /* Set the zero-copy parameter on the input port */
-   status = mmal_port_parameter_set_boolean(decoder->input[0], MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
-   CHECK_STATUS(status, "failed to set zero copy - %s", decoder->input[0]->name);
+//   status = mmal_port_parameter_set_boolean(decoder->input[0], MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
+//   CHECK_STATUS(status, "failed to set zero copy - %s", decoder->input[0]->name);
 
    /* Set the zero-copy parameter on the output port */
    status = mmal_port_parameter_set_boolean(decoder->output[0], MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
@@ -772,10 +819,10 @@ int main(int argc, char **argv)
 
    /* The format of both ports is now set so we can get their buffer requirements and create
     * our buffer headers. We use the buffer pool API to create these. */
-   decoder->input[0]->buffer_num = decoder->input[0]->buffer_num_min;
-   decoder->input[0]->buffer_size = decoder->input[0]->buffer_size_min;
+   decoder->input[0]->buffer_num = decoder->input[0]->buffer_num_recommended;
+   decoder->input[0]->buffer_size = decoder->input[0]->buffer_size_recommended;
    decoder->output[0]->buffer_num = decoder->output[0]->buffer_num_recommended;
-   decoder->output[0]->buffer_size = decoder->output[0]->buffer_size_min;
+   decoder->output[0]->buffer_size = decoder->output[0]->buffer_size_recommended;
    pool_in = mmal_port_pool_create(decoder->input[0],
                                    decoder->input[0]->buffer_num,
                                    decoder->input[0]->buffer_size);
@@ -809,7 +856,7 @@ int main(int argc, char **argv)
    status = mmal_port_format_commit(isp->output[0]);
    CHECK_STATUS(status, "failed to set ISP output format");
    isp->output[0]->buffer_num = MAX_BUFFERS;
-   isp->output[0]->buffer_size = isp->output[0]->buffer_size_min;
+   isp->output[0]->buffer_size = isp->output[0]->buffer_size_recommended;
 
    status = mmal_port_enable(isp->output[0], output_callback);
    CHECK_STATUS(status, "failed to enable isp output port");
@@ -889,7 +936,7 @@ int main(int argc, char **argv)
                status = mmal_format_full_copy(isp->output[0]->format, event->format);
                isp->output[0]->format->encoding = ENCODING_FOR_DRM;
                isp->output[0]->buffer_num = MAX_BUFFERS;
-               isp->output[0]->buffer_size = isp->output[0]->buffer_size_min;
+               isp->output[0]->buffer_size = isp->output[0]->buffer_size_recommended;
 
                if (status == MMAL_SUCCESS)
                   status = mmal_port_format_commit(isp->output[0]);
