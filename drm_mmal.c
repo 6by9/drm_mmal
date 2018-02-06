@@ -849,6 +849,28 @@ present_dmabuf(EGLDisplay dpy, EGLContext ctx, EGLSurface surf,
    attribs[i++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;
    attribs[i++] = buffer->pitches[0];
 
+   if (buffer->pitches[1]) {
+      attribs[i++] = EGL_DMA_BUF_PLANE1_FD_EXT;
+      attribs[i++] = buffer->dbuf_fd;
+
+      attribs[i++] = EGL_DMA_BUF_PLANE1_OFFSET_EXT;
+      attribs[i++] = 0;
+
+      attribs[i++] = EGL_DMA_BUF_PLANE1_PITCH_EXT;
+      attribs[i++] = buffer->pitches[1];
+   }
+
+   if (buffer->pitches[2]) {
+      attribs[i++] = EGL_DMA_BUF_PLANE2_FD_EXT;
+      attribs[i++] = buffer->dbuf_fd;
+
+      attribs[i++] = EGL_DMA_BUF_PLANE2_OFFSET_EXT;
+      attribs[i++] = 0;
+
+      attribs[i++] = EGL_DMA_BUF_PLANE2_PITCH_EXT;
+      attribs[i++] = buffer->pitches[1];
+   }
+
    attribs[i++] = EGL_NONE;
 
    EGLImage image = eglCreateImageKHR(dpy,
