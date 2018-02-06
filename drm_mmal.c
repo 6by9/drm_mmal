@@ -132,7 +132,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //MMAL_ENCODING_BGR24
 //Patches sorted for vc4_plane.c for each of these, and then they work.
 //
-#define ENCODING_FOR_DRM  MMAL_ENCODING_RGBA
+#define ENCODING_FOR_DRM  MMAL_ENCODING_YV12
 
 #define DRM_MODULE "vc4"
 #define MAX_BUFFERS 3
