@@ -34,6 +34,50 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
+/* Portions of the code lifted from glxgears, under: */
+/*
+ * Copyright (C) 1999-2001  Brian Paul   All Rights Reserved.
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * BRIAN PAUL BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+/* Portions of the code lifted from piglit, under: */
+/*
+ * Copyright (c) The Piglit project 2007
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * on the rights to use, copy, modify, merge, publish, distribute, sub
+ * license, and/or sell copies of the Software, and to permit persons to whom
+ * the Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.  IN NO EVENT SHALL
+ * VA LINUX SYSTEM, IBM AND/OR THEIR SUPPLIERS BE LIABLE FOR ANY CLAIM,
+ * DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+ * OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+ * USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -51,8 +95,16 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <drm.h>
 #include <drm_mode.h>
+#include <drm_fourcc.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/Xlib-xcb.h>
+#include <epoxy/gl.h>
+#include <epoxy/egl.h>
+#include <xcb/xcb.h>
+#include <xcb/dri3.h>
 
 #include <interface/vcsm/user-vcsm.h>
 #include "bcm_host.h"
@@ -80,7 +132,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //MMAL_ENCODING_BGR24
 //Patches sorted for vc4_plane.c for each of these, and then they work.
 //
-#define ENCODING_FOR_DRM  MMAL_ENCODING_I420
+#define ENCODING_FOR_DRM  MMAL_ENCODING_RGBA
 
 #define DRM_MODULE "vc4"
 #define MAX_BUFFERS 3
@@ -139,17 +191,18 @@ static struct CONTEXT_T {
 
 struct buffer {
    unsigned int bo_handle;
-   unsigned int fb_handle;
+   uint32_t pitches[4];
    int dbuf_fd;
    unsigned int vcsm_handle;
    MMAL_BUFFER_HEADER_T *mmal_buffer;
 };
 
 struct drm_setup {
-   int conId;
-   uint32_t crtcId;
-   int crtcIdx;
-   uint32_t planeId;
+   Display *dpy;
+   EGLDisplay egl_dpy;
+   EGLContext ctx;
+   EGLSurface surf;
+   Window win;
    unsigned int out_fourcc;
    MMAL_RECT_T compose;
 };
@@ -246,6 +299,9 @@ uint32_t mmal_encoding_to_drm_fourcc(uint32_t mmal_encoding)
 
 void mmal_format_to_drm_pitches_offsets(uint32_t *pitches, uint32_t *offsets, uint32_t *bo_handles, MMAL_ES_FORMAT_T *format)
 {
+   for (int i = 0; i < 4; i++)
+      pitches[i] = 0;
+
    switch (format->encoding)
    {
       // 3 plane YUV formats
@@ -325,12 +381,12 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
    b->dbuf_fd = prime.fd;
 
    uint32_t offsets[4] = { 0 };
-   uint32_t pitches[4] = { 0 };
    uint32_t bo_handles[4] = { b->bo_handle };
    unsigned int fourcc = mmal_encoding_to_drm_fourcc(port->format->encoding);
 
-   mmal_format_to_drm_pitches_offsets(pitches, offsets, bo_handles, port->format);
+   mmal_format_to_drm_pitches_offsets(b->pitches, offsets, bo_handles, port->format);
 
+   
    fprintf(stderr, "FB fourcc %c%c%c%c\n",
       fourcc,
       fourcc >> 8,
@@ -341,19 +397,7 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
    if (!b->vcsm_handle)
       goto fail_prime;
 
-   ret = drmModeAddFB2(drmfd, port->format->es->video.crop.width,
-      port->format->es->video.crop.height, fourcc, bo_handles,
-      pitches, offsets, &b->fb_handle, 0);
-   if (ret)
-   {
-      printf("drmModeAddFB2 failed: %s\n", ERRSTR);
-      goto fail_vcsm;
-   }
-
    return 0;
-
-fail_vcsm:
-   vcsm_free(b->vcsm_handle);
 
 fail_prime:
    close(b->dbuf_fd);
@@ -442,152 +486,6 @@ static void control_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
    vcos_semaphore_post(&ctx->semaphore);
 }
 
-static int find_crtc(int drmfd, struct drm_setup *s, uint32_t *con)
-{
-   int ret = -1;
-   int i;
-   drmModeRes *res = drmModeGetResources(drmfd);
-   if(!res) 
-   {
-      printf( "drmModeGetResources failed: %s\n", ERRSTR);
-      return -1;
-   }
-
-   if (res->count_crtcs <= 0)
-   {
-      printf( "drm: no crts\n");
-      goto fail_res;
-   }
-
-   if (!s->conId) {
-      fprintf(stderr,
-         "No connector ID specified.  Choosing default from list:\n");
-
-      for (i = 0; i < res->count_connectors; i++) {
-         drmModeConnector *con =
-            drmModeGetConnector(drmfd, res->connectors[i]);
-         drmModeEncoder *enc = NULL;
-         drmModeCrtc *crtc = NULL;
-
-         if (con->encoder_id) {
-            enc = drmModeGetEncoder(drmfd, con->encoder_id);
-            if (enc->crtc_id) {
-               crtc = drmModeGetCrtc(drmfd, enc->crtc_id);
-            }
-         }
-
-         if (!s->conId && crtc) {
-            s->conId = con->connector_id;
-            s->crtcId = crtc->crtc_id;
-         }
-
-         printf("Connector %d (crtc %d): type %d, %dx%d%s\n",
-                con->connector_id,
-                crtc ? crtc->crtc_id : 0,
-                con->connector_type,
-                crtc ? crtc->width : 0,
-                crtc ? crtc->height : 0,
-                (s->conId == (int)con->connector_id ?
-            " (chosen)" : ""));
-      }
-
-      if (!s->conId) {
-         fprintf(stderr,
-            "No suitable enabled connector found.\n");
-         exit(1);
-      }
-   }
-
-   s->crtcIdx = -1;
-
-   for (i = 0; i < res->count_crtcs; ++i) {
-      if (s->crtcId == res->crtcs[i]) {
-         s->crtcIdx = i;
-         break;
-      }
-   }
-
-   if (WARN_ON(s->crtcIdx == -1, "drm: CRTC %u not found\n", s->crtcId))
-      goto fail_res;
-
-   if (WARN_ON(res->count_connectors <= 0, "drm: no connectors\n"))
-      goto fail_res;
-
-   drmModeConnector *c;
-   c = drmModeGetConnector(drmfd, s->conId);
-   if (WARN_ON(!c, "drmModeGetConnector failed: %s\n", ERRSTR))
-      goto fail_res;
-
-   if (WARN_ON(!c->count_modes, "connector supports no mode\n"))
-      goto fail_conn;
-
-   {
-      drmModeCrtc *crtc = drmModeGetCrtc(drmfd, s->crtcId);
-      s->compose.x = crtc->x;
-      s->compose.y = crtc->y;
-      s->compose.width = crtc->width;
-      s->compose.height = crtc->height;
-      drmModeFreeCrtc(crtc);
-   }
-
-   if (con)
-      *con = c->connector_id;
-   ret = 0;
-
-fail_conn:
-   drmModeFreeConnector(c);
-
-fail_res:
-   drmModeFreeResources(res);
-
-   return ret;
-}
-
-static int find_plane(int drmfd, struct drm_setup *s)
-{
-   drmModePlaneResPtr planes;
-   drmModePlanePtr plane;
-   unsigned int i;
-   unsigned int j;
-   int ret = 0;
-
-   planes = drmModeGetPlaneResources(drmfd);
-   if (WARN_ON(!planes, "drmModeGetPlaneResources failed: %s\n", ERRSTR))
-      return -1;
-
-   for (i = 0; i < planes->count_planes; ++i) {
-      plane = drmModeGetPlane(drmfd, planes->planes[i]);
-      if (WARN_ON(!planes, "drmModeGetPlane failed: %s\n", ERRSTR))
-         break;
-
-      if (!(plane->possible_crtcs & (1 << s->crtcIdx))) {
-         drmModeFreePlane(plane);
-         continue;
-      }
-
-      for (j = 0; j < plane->count_formats; ++j) {
-         if (plane->formats[j] == s->out_fourcc)
-            break;
-      }
-
-      if (j == plane->count_formats) {
-         drmModeFreePlane(plane);
-         continue;
-      }
-
-      s->planeId = plane->plane_id;
-      drmModeFreePlane(plane);
-      break;
-   }
-
-   if (i == planes->count_planes)
-      ret = -1;
-
-   drmModeFreePlaneResources(planes);
-   return ret;
-}
-
-
 /** Callback from the input port.
  * Buffer has been consumed and is available to be used again. */
 static void input_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
@@ -665,6 +563,327 @@ error:
    return status;
 }
 
+
+/**
+ * Remove window border/decorations.
+ */
+static void
+no_border( Display *dpy, Window w)
+{
+   static const unsigned MWM_HINTS_DECORATIONS = (1 << 1);
+   static const int PROP_MOTIF_WM_HINTS_ELEMENTS = 5;
+
+   typedef struct
+   {
+      unsigned long       flags;
+      unsigned long       functions;
+      unsigned long       decorations;
+      long                inputMode;
+      unsigned long       status;
+   } PropMotifWmHints;
+
+   PropMotifWmHints motif_hints;
+   Atom prop, proptype;
+   unsigned long flags = 0;
+
+   /* setup the property */
+   motif_hints.flags = MWM_HINTS_DECORATIONS;
+   motif_hints.decorations = flags;
+
+   /* get the atom for the property */
+   prop = XInternAtom( dpy, "_MOTIF_WM_HINTS", True );
+   if (!prop) {
+      /* something went wrong! */
+      return;
+   }
+
+   /* not sure this is correct, seems to work, XA_WM_HINTS didn't work */
+   proptype = prop;
+
+   XChangeProperty( dpy, w,                         /* display, window */
+                    prop, proptype,                 /* property, type */
+                    32,                             /* format: 32-bit datums */
+                    PropModeReplace,                /* mode */
+                    (unsigned char *) &motif_hints, /* data */
+                    PROP_MOTIF_WM_HINTS_ELEMENTS    /* nelements */
+                  );
+}
+
+
+/*
+ * Create an RGB, double-buffered window.
+ * Return the window and context handles.
+ */
+static void
+make_window( Display *dpy, EGLDisplay egl_dpy, const char *name,
+             int x, int y, int width, int height,
+             Window *winRet, EGLContext *ctxRet, EGLSurface *surfRet)
+{
+   int scrnum = DefaultScreen( dpy );
+   XSetWindowAttributes attr;
+   unsigned long mask;
+   Window root = RootWindow( dpy, scrnum );
+   Window win;
+   EGLContext ctx;
+   bool fullscreen = false; /* Hook this up to a command line arg */
+
+   if (fullscreen) {
+      int scrnum = DefaultScreen(dpy);
+
+      x = 0; y = 0;
+      width = DisplayWidth(dpy, scrnum);
+      height = DisplayHeight(dpy, scrnum);
+   }
+
+   static const EGLint attribs[] = {
+      EGL_RED_SIZE, 1,
+      EGL_GREEN_SIZE, 1,
+      EGL_BLUE_SIZE, 1,
+      EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+      EGL_NONE
+   };
+   EGLConfig config;
+   EGLint num_configs;
+   if (!eglChooseConfig(egl_dpy, attribs, &config, 1, &num_configs)) {
+      printf("Error: couldn't get an EGL visual config\n");
+      exit(1);
+   }
+
+   EGLint vid;
+   if (!eglGetConfigAttrib(egl_dpy, config, EGL_NATIVE_VISUAL_ID, &vid)) {
+      printf("Error: eglGetConfigAttrib() failed\n");
+      exit(1);
+   }
+
+   XVisualInfo visTemplate = {
+      .visualid = vid,
+   };
+   int num_visuals;
+   XVisualInfo *visinfo = XGetVisualInfo(dpy, VisualIDMask,
+                                         &visTemplate, &num_visuals);
+
+   /* window attributes */
+   attr.background_pixel = 0;
+   attr.border_pixel = 0;
+   attr.colormap = XCreateColormap( dpy, root, visinfo->visual, AllocNone);
+   attr.event_mask = StructureNotifyMask | ExposureMask | KeyPressMask;
+   /* XXX this is a bad way to get a borderless window! */
+   mask = CWBackPixel | CWBorderPixel | CWColormap | CWEventMask;
+
+   win = XCreateWindow( dpy, root, x, y, width, height,
+                        0, visinfo->depth, InputOutput,
+                        visinfo->visual, mask, &attr );
+
+   if (fullscreen)
+      no_border(dpy, win);
+
+   /* set hints and properties */
+   {
+      XSizeHints sizehints;
+      sizehints.x = x;
+      sizehints.y = y;
+      sizehints.width  = width;
+      sizehints.height = height;
+      sizehints.flags = USSize | USPosition;
+      XSetNormalHints(dpy, win, &sizehints);
+      XSetStandardProperties(dpy, win, name, name,
+                              None, (char **)NULL, 0, &sizehints);
+   }
+
+   eglBindAPI(EGL_OPENGL_ES_API);
+
+   static const EGLint ctx_attribs[] = {
+      EGL_CONTEXT_CLIENT_VERSION, 2,
+      EGL_NONE
+   };
+   ctx = eglCreateContext(egl_dpy, config, EGL_NO_CONTEXT, ctx_attribs );
+   if (!ctx) {
+      printf("Error: eglCreateContext failed\n");
+      exit(1);
+   }
+
+   XFree(visinfo);
+
+   XMapWindow(dpy, win);
+
+   EGLSurface surf = eglCreateWindowSurface(egl_dpy, config,
+                                            (void *)(uintptr_t)win, NULL);
+   if (!surf) {
+      printf("Error: eglCreateWindowSurface failed\n");
+      exit(1);
+   }
+
+   if (!eglMakeCurrent(egl_dpy, surf, surf, ctx)) {
+      printf("Error: eglCreateContext failed\n");
+      exit(1);
+   }
+
+   *winRet = win;
+   *ctxRet = ctx;
+   *surfRet = surf;
+}
+
+static GLint
+compile_shader(GLenum target, const char *source)
+{
+   GLuint s = glCreateShader(target);
+	glShaderSource(s, 1, (const GLchar **) &source, NULL);
+	glCompileShader(s);
+
+   GLint ok;
+   glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+
+   if (!ok) {
+		GLchar *info;
+		GLint size;
+
+		glGetShaderiv(s, GL_INFO_LOG_LENGTH, &size);
+		info = malloc(size);
+
+		glGetShaderInfoLog(s, size, NULL, info);
+      fprintf(stderr, "Failed to compile shader: %s\n", info);
+
+      fprintf(stderr, "source:\n%s", source);
+
+      exit(1);
+   }
+
+   return s;
+}
+
+static GLint link_program(GLint vs, GLint fs)
+{
+	GLint prog = glCreateProgram();
+   glAttachShader(prog, vs);
+   glAttachShader(prog, fs);
+   glLinkProgram(prog);
+
+   GLint ok;
+   glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+   if (!ok) {
+      /* Some drivers return a size of 1 for an empty log.  This is the size
+       * of a log that contains only a terminating NUL character.
+       */
+      GLint size;
+      GLchar *info = NULL;
+      glGetProgramiv(prog, GL_INFO_LOG_LENGTH, &size);
+      if (size > 1) {
+         info = malloc(size);
+         glGetProgramInfoLog(prog, size, NULL, info);
+      }
+
+      fprintf(stderr, "Failed to link: %s\n",
+              (info != NULL) ? info : "<empty log>");
+      exit(1);
+   }
+
+   return prog;
+}
+
+static void
+gl_setup(void)
+{
+   const char *vs =
+      "attribute vec4 pos;\n"
+      "varying vec2 texcoord;\n"
+      "\n"
+      "void main() {\n"
+      "  gl_Position = pos;\n"
+      "  texcoord.x = (pos.x + 1.0) / 2.0;\n"
+      "  texcoord.y = (pos.y + 1.0) / -2.0;\n"
+      "}\n";
+   GLint vs_s = compile_shader(GL_VERTEX_SHADER, vs);
+   const char *fs =
+      "precision mediump float;\n"
+      "uniform sampler2D s;\n"
+      "varying vec2 texcoord;\n"
+      "void main() {\n"
+      "  gl_FragColor = texture2D(s, texcoord);\n"
+      "}\n";
+   GLint fs_s = compile_shader(GL_FRAGMENT_SHADER, fs);
+   GLint prog = link_program(vs_s, fs_s);
+
+   glUseProgram(prog);
+   GLuint tex;
+   glGenTextures(1, &tex);
+   glBindTexture(GL_TEXTURE_2D, tex);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+   static const float verts[] = {
+      -1, -1,
+      1, -1,
+      1, 1,
+      -1, 1,
+   };
+   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, verts);
+   glEnableVertexAttribArray(0);
+
+   /* XXX: Check for the import extension */
+}
+
+static void
+present_dmabuf(EGLDisplay dpy, EGLContext ctx, EGLSurface surf,
+               int fourcc, struct buffer *buffer, int w, int h)
+{
+   glClearColor(0.5, 0.5, 0.5, 0.5);
+   glClear(GL_COLOR_BUFFER_BIT);
+
+   EGLint attribs[] = {
+      EGL_WIDTH, w,
+      EGL_HEIGHT, h,
+      EGL_LINUX_DRM_FOURCC_EXT, fourcc,
+      EGL_DMA_BUF_PLANE0_FD_EXT, buffer->dbuf_fd,
+      EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+      EGL_DMA_BUF_PLANE0_PITCH_EXT, buffer->pitches[0],
+      EGL_NONE
+   };
+   EGLImage image = eglCreateImageKHR(dpy,
+                                      EGL_NO_CONTEXT,
+                                      EGL_LINUX_DMA_BUF_EXT,
+                                      NULL, attribs);
+   if (!image) {
+      fprintf(stderr, "Failed to import fd %d\n", buffer->dbuf_fd);
+   }
+
+   glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
+   glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+   eglSwapBuffers(dpy, surf);
+
+   eglDestroyImageKHR(dpy, image);
+}
+
+static int
+get_drm_fd(Display *dpy)
+{
+   xcb_connection_t *c = XGetXCBConnection(dpy);
+   xcb_window_t root = RootWindow(dpy, DefaultScreen(dpy));
+   int fd;
+
+   const xcb_query_extension_reply_t *extension =
+      xcb_get_extension_data(c, &xcb_dri3_id);
+   if (!(extension && extension->present))
+      return -1;
+
+   xcb_dri3_open_cookie_t cookie =
+      xcb_dri3_open(c, root, None);
+
+   xcb_dri3_open_reply_t *reply = xcb_dri3_open_reply(c, cookie, NULL);
+   if (!reply)
+      return -1;
+
+   if (reply->nfd != 1) {
+      free(reply);
+      return -1;
+   }
+
+   fd = xcb_dri3_open_reply_fds(c, reply)[0];
+   free(reply);
+   fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
+
+   return fd;
+}
+
 int main(int argc, char **argv)
 {
    MMAL_STATUS_T status = MMAL_EINVAL;
@@ -676,7 +895,6 @@ int main(int argc, char **argv)
    MMAL_BUFFER_HEADER_T *current_buffer = NULL;
    MMAL_CONNECTION_T *connection = NULL;
    unsigned int in_count = 0, conn_out_count = 0, conn_in_count = 0, out_count = 0;
-   int ret;
 
    if (argc < 2)
    {
@@ -686,8 +904,21 @@ int main(int argc, char **argv)
 
    bcm_host_init();
 
-   int drmfd = drmOpen(DRM_MODULE, NULL);
-   CHECK_CONDITION(drmfd < 0, "drmOpen(%s) failed: %s\n", DRM_MODULE, ERRSTR);
+   setup.dpy = XOpenDisplay(NULL);
+   CHECK_CONDITION(!setup.dpy, "Couldn't open X display\n");
+
+   setup.egl_dpy = eglGetDisplay(setup.dpy);
+   CHECK_CONDITION(!setup.egl_dpy, "eglGetDisplay() failed\n");
+
+   EGLint egl_major, egl_minor;
+   CHECK_CONDITION(!eglInitialize(setup.egl_dpy, &egl_major, &egl_minor),
+                   "Error: eglInitialize() failed\n");
+
+   /* Get an authenticated DRM fd from X, since we're doing DMABUF
+    * import from vc4 buffers to vcsm.  We'd really rather be having
+    * vcsm export the MMAL buffers to us.
+    */
+   int drmfd = get_drm_fd(setup.dpy);
 
    vcsm_init();
 
@@ -817,13 +1048,10 @@ int main(int argc, char **argv)
    pool_out = pool_create_drm(isp->output[0], buffers, drmfd);
    setup.out_fourcc = mmal_encoding_to_drm_fourcc(ENCODING_FOR_DRM);
 
-   uint32_t con;
-   ret = find_crtc(drmfd, &setup, &con);
-   CHECK_CONDITION(ret, "failed to find valid mode\n");
+   make_window(setup.dpy, setup.egl_dpy, "mmal-demo",
+               0, 0, 800, 600, &setup.win, &setup.ctx, &setup.surf);
 
-   ret = find_plane(drmfd, &setup);
-   CHECK_CONDITION(ret, "failed to find compatible plane\n");
-
+   gl_setup();
 
    /* Start decoding */
    fprintf(stderr, "start decoding\n");
@@ -974,15 +1202,11 @@ int main(int argc, char **argv)
             else
                continue;
 
-            ret = drmModeSetPlane(drmfd, setup.planeId, setup.crtcId,
-                        buffers[index].fb_handle, 0,
-                        setup.compose.x, setup.compose.y,
-                        setup.compose.width,
-                        setup.compose.height,
-                        0, 0,
-                        isp->output[0]->format->es->video.crop.width << 16,
-                        isp->output[0]->format->es->video.crop.height << 16);
-            CHECK_CONDITION(ret, "drmModeSetPlane failed: %s\n", ERRSTR);
+            present_dmabuf(setup.egl_dpy, setup.ctx, setup.surf,
+                           setup.out_fourcc,
+                           &buffers[index],
+                           format_out->es->video.crop.width,
+                           format_out->es->video.crop.height);
 
             //Release buffer that was on the screen
             if (current_buffer)

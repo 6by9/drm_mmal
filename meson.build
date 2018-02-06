@@ -41,6 +41,11 @@ executable(
     dependency('threads'),
     cc.find_library('rt'),
     dependency('libdrm'),
+    dependency('x11'),
+    dependency('xcb'),
+    dependency('x11-xcb'),
+    dependency('xcb-dri3'),
+    dependency('epoxy'),
     mmal_dep,
   ],
 )
