@@ -191,10 +191,10 @@ static struct CONTEXT_T {
 
 struct buffer {
    unsigned int bo_handle;
-   uint32_t pitches[4];
    int dbuf_fd;
    unsigned int vcsm_handle;
    MMAL_BUFFER_HEADER_T *mmal_buffer;
+   GLuint texture;
 };
 
 struct drm_setup {
@@ -299,9 +299,6 @@ uint32_t mmal_encoding_to_drm_fourcc(uint32_t mmal_encoding)
 
 void mmal_format_to_drm_pitches_offsets(uint32_t *pitches, uint32_t *offsets, uint32_t *bo_handles, MMAL_ES_FORMAT_T *format)
 {
-   for (int i = 0; i < 4; i++)
-      pitches[i] = 0;
-
    switch (format->encoding)
    {
       // 3 plane YUV formats
@@ -347,7 +344,8 @@ void mmal_format_to_drm_pitches_offsets(uint32_t *pitches, uint32_t *offsets, ui
             );
 }
 
-static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
+static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port,
+                         EGLDisplay dpy, EGLContext ctx)
 {
    struct drm_mode_create_dumb gem;
    struct drm_mode_destroy_dumb gem_destroy;
@@ -380,11 +378,12 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
    printf("dbuf_fd = %d\n", prime.fd);
    b->dbuf_fd = prime.fd;
 
+   uint32_t pitches[4] = { 0 };
    uint32_t offsets[4] = { 0 };
    uint32_t bo_handles[4] = { b->bo_handle };
    unsigned int fourcc = mmal_encoding_to_drm_fourcc(port->format->encoding);
 
-   mmal_format_to_drm_pitches_offsets(b->pitches, offsets, bo_handles, port->format);
+   mmal_format_to_drm_pitches_offsets(pitches, offsets, bo_handles, port->format);
 
    
    fprintf(stderr, "FB fourcc %c%c%c%c\n",
@@ -396,6 +395,67 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
    b->vcsm_handle = vcsm_import_dmabuf(b->dbuf_fd, "DRM Buf");
    if (!b->vcsm_handle)
       goto fail_prime;
+
+   EGLint attribs[50];
+   int i = 0;
+
+   attribs[i++] = EGL_WIDTH;
+   attribs[i++] = port->format->es->video.width;
+   attribs[i++] = EGL_HEIGHT;
+   attribs[i++] = port->format->es->video.height;
+
+   attribs[i++] = EGL_LINUX_DRM_FOURCC_EXT;
+   attribs[i++] = fourcc;
+
+   attribs[i++] = EGL_DMA_BUF_PLANE0_FD_EXT;
+   attribs[i++] = b->dbuf_fd;
+
+   attribs[i++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT;
+   attribs[i++] = 0;
+
+   attribs[i++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;
+   attribs[i++] = pitches[0];
+
+   if (pitches[1]) {
+      attribs[i++] = EGL_DMA_BUF_PLANE1_FD_EXT;
+      attribs[i++] = b->dbuf_fd;
+
+      attribs[i++] = EGL_DMA_BUF_PLANE1_OFFSET_EXT;
+      attribs[i++] = 0;
+
+      attribs[i++] = EGL_DMA_BUF_PLANE1_PITCH_EXT;
+      attribs[i++] = pitches[1];
+   }
+
+   if (pitches[2]) {
+      attribs[i++] = EGL_DMA_BUF_PLANE2_FD_EXT;
+      attribs[i++] = b->dbuf_fd;
+
+      attribs[i++] = EGL_DMA_BUF_PLANE2_OFFSET_EXT;
+      attribs[i++] = 0;
+
+      attribs[i++] = EGL_DMA_BUF_PLANE2_PITCH_EXT;
+      attribs[i++] = pitches[2];
+   }
+
+   attribs[i++] = EGL_NONE;
+
+   EGLImage image = eglCreateImageKHR(dpy,
+                                      EGL_NO_CONTEXT,
+                                      EGL_LINUX_DMA_BUF_EXT,
+                                      NULL, attribs);
+   if (!image) {
+      fprintf(stderr, "Failed to import fd %d\n", b->dbuf_fd);
+      exit(1);
+   }
+
+   glGenTextures(1, &b->texture);
+   glBindTexture(GL_TEXTURE_2D, b->texture);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+   glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
+
+   eglDestroyImageKHR(dpy, image);
 
    return 0;
 
@@ -414,7 +474,8 @@ fail_gem:
    return -1;
 }
 
-MMAL_POOL_T* pool_create_drm(MMAL_PORT_T *port, struct buffer *buffers, int drmfd)
+MMAL_POOL_T* pool_create_drm(MMAL_PORT_T *port, struct buffer *buffers, int drmfd,
+                             EGLDisplay dpy, EGLContext ctx)
 {
    MMAL_POOL_T *pool;
    unsigned int i;
@@ -425,7 +486,7 @@ MMAL_POOL_T* pool_create_drm(MMAL_PORT_T *port, struct buffer *buffers, int drmf
 
    for (i = 0; i < port->buffer_num; i++)
    {
-      buffer_create(&buffers[i], drmfd, port);
+      buffer_create(&buffers[i], drmfd, port, dpy, ctx);
       
       pool->header[i]->data = (uint8_t*)vcsm_vc_hdl_from_hdl(buffers[i].vcsm_handle);
       pool->header[i]->alloc_size = port->buffer_size;
@@ -441,7 +502,7 @@ void buffer_destroy(int drmfd, struct buffer *buf)
    struct drm_mode_destroy_dumb gem_destroy;
 
    vcsm_free(buf->vcsm_handle);
-
+   glDeleteTextures(1, &buf->texture);
    close(buf->dbuf_fd);
 
    memset(&gem_destroy, 0, sizeof gem_destroy);
@@ -518,15 +579,15 @@ static void drm_mmal_connection_cb(MMAL_CONNECTION_T *connection)
    vcos_semaphore_post(&ctx->semaphore);
 }
 
-static int drm_mmal_create_buffers(MMAL_PORT_T *port, struct buffer *buffers, int drmfd, MMAL_POOL_T **pool_out)
+static int drm_mmal_create_buffers(MMAL_PORT_T *port, struct buffer *buffers, int drmfd, MMAL_POOL_T **pool_out,
+                                   EGLDisplay dpy, EGLContext ctx)
 {
    MMAL_STATUS_T status;
    port->buffer_size = port->buffer_size_min;
    printf("Set buffer size to %d\n", port->buffer_size);
    status = mmal_port_format_commit(port);
 
-   *pool_out = pool_create_drm(port,
-                              buffers, drmfd);
+   *pool_out = pool_create_drm(port, buffers, drmfd, dpy, ctx);
 
    status = mmal_port_enable(port, output_callback);
    CHECK_STATUS(status, "failed to enable port");
@@ -804,11 +865,6 @@ gl_setup(void)
    GLint prog = link_program(vs_s, fs_s);
 
    glUseProgram(prog);
-   GLuint tex;
-   glGenTextures(1, &tex);
-   glBindTexture(GL_TEXTURE_2D, tex);
-   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
    static const float verts[] = {
       -1, -1,
@@ -818,74 +874,18 @@ gl_setup(void)
    };
    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, verts);
    glEnableVertexAttribArray(0);
-
-   /* XXX: Check for the import extension */
 }
 
 static void
 present_dmabuf(EGLDisplay dpy, EGLContext ctx, EGLSurface surf,
-               int fourcc, struct buffer *buffer, int w, int h)
+               struct buffer *buffer)
 {
    glClearColor(0.5, 0.5, 0.5, 0.5);
    glClear(GL_COLOR_BUFFER_BIT);
 
-   EGLint attribs[50];
-   int i = 0;
-
-   attribs[i++] = EGL_WIDTH;
-   attribs[i++] = w;
-   attribs[i++] = EGL_HEIGHT;
-   attribs[i++] = h;
-
-   attribs[i++] = EGL_LINUX_DRM_FOURCC_EXT;
-   attribs[i++] = fourcc;
-
-   attribs[i++] = EGL_DMA_BUF_PLANE0_FD_EXT;
-   attribs[i++] = buffer->dbuf_fd;
-
-   attribs[i++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT;
-   attribs[i++] = 0;
-
-   attribs[i++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;
-   attribs[i++] = buffer->pitches[0];
-
-   if (buffer->pitches[1]) {
-      attribs[i++] = EGL_DMA_BUF_PLANE1_FD_EXT;
-      attribs[i++] = buffer->dbuf_fd;
-
-      attribs[i++] = EGL_DMA_BUF_PLANE1_OFFSET_EXT;
-      attribs[i++] = 0;
-
-      attribs[i++] = EGL_DMA_BUF_PLANE1_PITCH_EXT;
-      attribs[i++] = buffer->pitches[1];
-   }
-
-   if (buffer->pitches[2]) {
-      attribs[i++] = EGL_DMA_BUF_PLANE2_FD_EXT;
-      attribs[i++] = buffer->dbuf_fd;
-
-      attribs[i++] = EGL_DMA_BUF_PLANE2_OFFSET_EXT;
-      attribs[i++] = 0;
-
-      attribs[i++] = EGL_DMA_BUF_PLANE2_PITCH_EXT;
-      attribs[i++] = buffer->pitches[1];
-   }
-
-   attribs[i++] = EGL_NONE;
-
-   EGLImage image = eglCreateImageKHR(dpy,
-                                      EGL_NO_CONTEXT,
-                                      EGL_LINUX_DMA_BUF_EXT,
-                                      NULL, attribs);
-   if (!image) {
-      fprintf(stderr, "Failed to import fd %d\n", buffer->dbuf_fd);
-   }
-
-   glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
+   glBindTexture(GL_TEXTURE_2D, buffer->texture);
    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
    eglSwapBuffers(dpy, surf);
-
-   eglDestroyImageKHR(dpy, image);
 }
 
 static int
@@ -1080,13 +1080,14 @@ int main(int argc, char **argv)
    status = mmal_port_enable(isp->output[0], output_callback);
    CHECK_STATUS(status, "failed to enable isp output port");
 
-   pool_out = pool_create_drm(isp->output[0], buffers, drmfd);
-   setup.out_fourcc = mmal_encoding_to_drm_fourcc(ENCODING_FOR_DRM);
-
    make_window(setup.dpy, setup.egl_dpy, "mmal-demo",
                0, 0, 800, 600, &setup.win, &setup.ctx, &setup.surf);
 
    gl_setup();
+
+   pool_out = pool_create_drm(isp->output[0], buffers, drmfd,
+                              setup.egl_dpy, setup.ctx);
+   setup.out_fourcc = mmal_encoding_to_drm_fourcc(ENCODING_FOR_DRM);
 
    /* Start decoding */
    fprintf(stderr, "start decoding\n");
@@ -1161,7 +1162,8 @@ int main(int argc, char **argv)
                   fprintf(stderr, "commit failed on output - %d\n", status);
                }
 
-               status = drm_mmal_create_buffers(isp->output[0], buffers, drmfd, &pool_out);
+               status = drm_mmal_create_buffers(isp->output[0], buffers, drmfd, &pool_out,
+                                                setup.egl_dpy, setup.ctx);
             }
             mmal_buffer_header_release(buffer);
             continue;
@@ -1238,10 +1240,7 @@ int main(int argc, char **argv)
                continue;
 
             present_dmabuf(setup.egl_dpy, setup.ctx, setup.surf,
-                           setup.out_fourcc,
-                           &buffers[index],
-                           format_out->es->video.crop.width,
-                           format_out->es->video.crop.height);
+                           &buffers[index]);
 
             //Release buffer that was on the screen
             if (current_buffer)
