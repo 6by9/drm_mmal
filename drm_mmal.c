@@ -450,10 +450,10 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port,
    }
 
    glGenTextures(1, &b->texture);
-   glBindTexture(GL_TEXTURE_2D, b->texture);
-   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-   glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
+   glBindTexture(GL_TEXTURE_EXTERNAL_OES, b->texture);
+   glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+   glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+   glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, image);
 
    eglDestroyImageKHR(dpy, image);
 
@@ -855,8 +855,9 @@ gl_setup(void)
       "}\n";
    GLint vs_s = compile_shader(GL_VERTEX_SHADER, vs);
    const char *fs =
+      "#extension GL_OES_EGL_image_external : enable\n"
       "precision mediump float;\n"
-      "uniform sampler2D s;\n"
+      "uniform samplerExternalOES s;\n"
       "varying vec2 texcoord;\n"
       "void main() {\n"
       "  gl_FragColor = texture2D(s, texcoord);\n"
@@ -883,7 +884,7 @@ present_dmabuf(EGLDisplay dpy, EGLContext ctx, EGLSurface surf,
    glClearColor(0.5, 0.5, 0.5, 0.5);
    glClear(GL_COLOR_BUFFER_BIT);
 
-   glBindTexture(GL_TEXTURE_2D, buffer->texture);
+   glBindTexture(GL_TEXTURE_EXTERNAL_OES, buffer->texture);
    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
    eglSwapBuffers(dpy, surf);
 }
