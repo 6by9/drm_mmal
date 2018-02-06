@@ -411,7 +411,7 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port,
    attribs[i++] = b->dbuf_fd;
 
    attribs[i++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT;
-   attribs[i++] = 0;
+   attribs[i++] = offsets[0];
 
    attribs[i++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;
    attribs[i++] = pitches[0];
@@ -421,7 +421,7 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port,
       attribs[i++] = b->dbuf_fd;
 
       attribs[i++] = EGL_DMA_BUF_PLANE1_OFFSET_EXT;
-      attribs[i++] = 0;
+      attribs[i++] = offsets[1];
 
       attribs[i++] = EGL_DMA_BUF_PLANE1_PITCH_EXT;
       attribs[i++] = pitches[1];
@@ -432,7 +432,7 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port,
       attribs[i++] = b->dbuf_fd;
 
       attribs[i++] = EGL_DMA_BUF_PLANE2_OFFSET_EXT;
-      attribs[i++] = 0;
+      attribs[i++] = offsets[2];
 
       attribs[i++] = EGL_DMA_BUF_PLANE2_PITCH_EXT;
       attribs[i++] = pitches[2];
