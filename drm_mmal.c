@@ -829,15 +829,28 @@ present_dmabuf(EGLDisplay dpy, EGLContext ctx, EGLSurface surf,
    glClearColor(0.5, 0.5, 0.5, 0.5);
    glClear(GL_COLOR_BUFFER_BIT);
 
-   EGLint attribs[] = {
-      EGL_WIDTH, w,
-      EGL_HEIGHT, h,
-      EGL_LINUX_DRM_FOURCC_EXT, fourcc,
-      EGL_DMA_BUF_PLANE0_FD_EXT, buffer->dbuf_fd,
-      EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
-      EGL_DMA_BUF_PLANE0_PITCH_EXT, buffer->pitches[0],
-      EGL_NONE
-   };
+   EGLint attribs[50];
+   int i = 0;
+
+   attribs[i++] = EGL_WIDTH;
+   attribs[i++] = w;
+   attribs[i++] = EGL_HEIGHT;
+   attribs[i++] = h;
+
+   attribs[i++] = EGL_LINUX_DRM_FOURCC_EXT;
+   attribs[i++] = fourcc;
+
+   attribs[i++] = EGL_DMA_BUF_PLANE0_FD_EXT;
+   attribs[i++] = buffer->dbuf_fd;
+
+   attribs[i++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT;
+   attribs[i++] = 0;
+
+   attribs[i++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;
+   attribs[i++] = buffer->pitches[0];
+
+   attribs[i++] = EGL_NONE;
+
    EGLImage image = eglCreateImageKHR(dpy,
                                       EGL_NO_CONTEXT,
                                       EGL_LINUX_DMA_BUF_EXT,
