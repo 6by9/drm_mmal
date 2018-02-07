@@ -851,7 +851,7 @@ gl_setup(void)
       "void main() {\n"
       "  gl_Position = pos;\n"
       "  texcoord.x = (pos.x + 1.0) / 2.0;\n"
-      "  texcoord.y = (pos.y + 1.0) / -2.0;\n"
+      "  texcoord.y = (-pos.y + 1.0) / 2.0;\n"
       "}\n";
    GLint vs_s = compile_shader(GL_VERTEX_SHADER, vs);
    const char *fs =
