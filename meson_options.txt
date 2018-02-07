@@ -1,0 +1,6 @@
+option(
+  'opt_vc',
+  type : 'string',
+  value: '/opt/vc',
+  description : 'raspberry pi userland directory',
+)
