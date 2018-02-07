@@ -290,7 +290,7 @@ void mmal_format_to_drm_pitches_offsets(uint32_t *pitches, uint32_t *offsets, ui
             );
 }
 
-#define VCSM_IMPORT 0
+#define VCSM_IMPORT 1
 static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
 {
    int ret;
@@ -536,6 +536,10 @@ static int find_crtc(int drmfd, struct drm_setup *s, uint32_t *con)
                 crtc ? crtc->height : 0,
                 (s->conId == (int)con->connector_id ?
             " (chosen)" : ""));
+
+         drmModeFreeCrtc(crtc);
+         drmModeFreeEncoder(enc);
+         drmModeFreeConnector(con);
       }
 
       if (!s->conId) {
@@ -1055,7 +1059,7 @@ int main(int argc, char **argv)
    /* Stop everything. Not strictly necessary since mmal_component_destroy()
     * will do that anyway */
    mmal_port_disable(decoder->input[0]);
-   mmal_port_disable(decoder->output[0]);
+   mmal_port_disable(isp->output[0]);
    mmal_component_disable(decoder);
 
  error:
@@ -1069,6 +1073,8 @@ int main(int argc, char **argv)
    }
    if (pool_out)
       pool_destroy_drm(isp->output[0], pool_out, buffers, drmfd);
+   close(drmfd);
+
    if (decoder)
       mmal_component_destroy(decoder);
    if (isp)
