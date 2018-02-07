@@ -132,7 +132,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //MMAL_ENCODING_BGR24
 //Patches sorted for vc4_plane.c for each of these, and then they work.
 //
-#define ENCODING_FOR_DRM  MMAL_ENCODING_YV12
+#define ENCODING_FOR_DRM  MMAL_ENCODING_RGBA
 
 #define DRM_MODULE "vc4"
 #define MAX_BUFFERS 3
@@ -1094,7 +1094,7 @@ int main(int argc, char **argv)
    fprintf(stderr, "start decoding\n");
 
    /* This is the main processing loop */
-   while(!eos_received && out_count < 10000)
+   while(!eos_received && out_count < 100)
    {
       MMAL_BUFFER_HEADER_T *buffer;
       VCOS_STATUS_T vcos_status;
