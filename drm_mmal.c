@@ -54,6 +54,60 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
+// New bits of DRM
+#define DRM_FORMAT_MOD_VENDOR_BROADCOM 0x07
+/* add more to the end as needed */
+
+#define DRM_FORMAT_RESERVED         ((1ULL << 56) - 1)
+
+#define fourcc_mod_code(vendor, val) \
+   ((((__u64)DRM_FORMAT_MOD_VENDOR_## vendor) << 56) | (val & 0x00ffffffffffffffULL))
+/*
+ * Some modifiers take parameters, for example the number of vertical GOBs in
+ * a block. Reserve the lower 32 bits for modifiers, and the next 24 bits for
+ * parameters. Top 8 bits are the vendor code.
+ */
+#define __fourcc_mod_vc4_param_shift 32
+#define __fourcc_mod_vc4_param_bits 24
+#define fourcc_mod_vc4_code(val, params) \
+   fourcc_mod_code(NV, ((((__u64)params) << __fourcc_mod_vc4_param_shift) | val))
+#define fourcc_mod_vc4_mod(m) \
+   ((__u64)m & ((1ULL << __fourcc_mod_vc4_param_shift) - 1))
+#define param_from_vc4_mod(m) \
+   (((__u64)m >> __fourcc_mod_vc4_param_shift) & \
+          ((1ULL << __fourcc_mod_vc4_param_bits) - 1))
+
+/*
+ * Broadcom SAND YUV4:2:0 format
+ *
+ * This is the native format that the H264 codec block uses. It is only valid
+ * on DRM_FORMAT_NV21.
+ * The image can be considered to be split into columns, and placing those
+ * columns consecutively into memory.
+ * The width of those columns can be either 32, 64, 128, or 256 pixels, but in
+ * practice only 128 pixel columns are used.
+ *
+ * The pitch between the start of each column is set to optimally switch
+ * between SDRAM banks. This is passed as the number of additional lines of luma
+ * required to achieve the correct value.
+ *
+ * There are two layouts of the luma and chroma planes, either each column has:
+ * - the luma, padding to a multiple of 16 lines, and then the chroma for that
+ *   column
+ * or
+ * - all the columns of luma (with padding to SDRAM page boundaries), followed
+ *   by all columns of chroma using the same column stride as the luma plane.
+ * The second layout is less efficient on memory, however certain hardware
+ * blocks have a limit on the column stride.
+ *
+ */
+#define DRM_FORMAT_MOD_BROADCOM_VC4_SAND128 fourcc_mod_code(BROADCOM, 2)
+
+#define DRM_FORMAT_MOD_BROADCOM_VC4_SAND128_COL_HEIGHT(v) \
+      (fourcc_mod_code(BROADCOM, ((uint64_t)(v) << __fourcc_mod_vc4_param_shift)) | \
+              DRM_FORMAT_MOD_BROADCOM_VC4_SAND128)
+
+
 #include <interface/vcsm/user-vcsm.h>
 #include "bcm_host.h"
 #include "interface/mmal/mmal.h"
@@ -72,6 +126,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //MMAL_ENCODING_BGRA
 //MMAL_ENCODING_RGBA
 //MMAL_ENCODING_RGB16 (RGB565)
+//MMAL_ENCODING_YUVUV128
 //
 //Valid to the ISP, but not DRM:
 //MMAL_ENCODING_NV21 (NV12 with cb/cr swapped)
@@ -79,7 +134,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //MMAL_ENCODING_BGR24
 //Patches sorted for vc4_plane.c for each of these, and then they work.
 //
-#define ENCODING_FOR_DRM  MMAL_ENCODING_I420
+#define ENCODING_FOR_DRM  MMAL_ENCODING_YUVUV128
 
 #define DRM_MODULE "vc4"
 #define MAX_BUFFERS 3
@@ -220,6 +275,7 @@ uint32_t mmal_encoding_to_drm_fourcc(uint32_t mmal_encoding)
          return MMAL_FOURCC('Y','V','1','2');
       case MMAL_ENCODING_I422:
          return MMAL_FOURCC('Y','U','1','6');
+      case MMAL_ENCODING_YUVUV128:
       case MMAL_ENCODING_NV12:
          return MMAL_FOURCC('N','V','1','2');
       case MMAL_ENCODING_NV21:
@@ -243,7 +299,70 @@ uint32_t mmal_encoding_to_drm_fourcc(uint32_t mmal_encoding)
    }
 }
 
-void mmal_format_to_drm_pitches_offsets(uint32_t *pitches, uint32_t *offsets, uint32_t *bo_handles, MMAL_ES_FORMAT_T *format)
+#define VC_IMAGE_YUV_UV_STRIPE_WIDTH_LOG2 7
+#define YUV_UV_MAX_STRIPE_HEIGHT  1264
+
+/* 1920 lines * 128 wide columns is a column stride of 0x3c000 which
+ * just fits once aligned with the current scheme (becomes 0x3c800).
+ * Adding any more lines than that exceeds the 0x40000 column stride
+ * limit required by the codec block.
+ */
+#define YUV_UV_MAX_TALL_MODE_HEIGHT 1920
+#define SAND_ALIGN 4096
+
+static int get_sand_column_pitch(int height)
+{
+   int pitch;
+
+   if (height <= (YUV_UV_MAX_TALL_MODE_HEIGHT-16))
+     height += 16; // for di_adv deinterlace
+   /* calculate required space for a Y stripe then pad it to align UV data */
+   pitch = ALIGN_UP(ALIGN_UP(height, 16) * 128, SAND_ALIGN);
+
+   /* For tall YUV_UV images, use independent stripes for UV.
+    * Pitch copes with only the Y (or the UV); the number of stripes is
+    * doubled.
+    * (See YUV_UV_MAX_STRIPE_HEIGHT).
+    */
+   if (height <= YUV_UV_MAX_STRIPE_HEIGHT)
+   {
+      /* then add the UV stripe space and re-align */
+      pitch = ALIGN_UP(pitch * 3 >> 1, SAND_ALIGN);
+   }
+
+   /*
+   The requirement in the source that the stride be an odd multiple of two pages in size is actually over-restrictive.
+   The intention is that in a four-bank SDRAM if a motion compensation source location overlaps a stripe boundary in X
+   and a page transition in Y then the four pages covered are in different banks (call this the "four corners property").
+   As we have an eight-bank device we get the desired effect if the stride is a multiple of the page size and stride/pagesize & 7 != 0, 1 or 7.
+   On Pi 2 our wacky custom SDRAM gives us 8k (64-line) pages, while on Pi 1 we have 4k (32-line) pages.
+   I think our best bet to satisfy the "four corners" property and avoid aliasing is to pad stripes to an odd multiple of 2k (an odd multiple of 16 lines),
+   and to avoid multiples which bring the banks in adjacent stripes so nearly into alignment that a 23 pixel high motcomp neighbourhood
+   can reach from a bank n page in stripe x to a bank n page in stripe x+1.
+   */
+   int h;
+   for (h = pitch >> (VC_IMAGE_YUV_UV_STRIPE_WIDTH_LOG2 + 4); ; h++)
+   {
+     if (0) //vc_image_helper_get_sdram_page_size() == 8192)
+     {
+       int hh = h % 32;
+       if ((hh & 1) && hh >= 7 && hh <= 25)
+         break;
+     }
+     else
+     {
+       //vcos_assert(vc_image_helper_get_sdram_page_size() == 4096);
+       int hh = h % 16;
+       if ((hh & 1) && hh >= 5 && hh <= 11)
+         break;
+     }
+   }
+   h <<= 4;
+   return h;
+}
+
+void mmal_format_to_drm_pitches_offsets(uint32_t *pitches, uint32_t *offsets, 
+         uint64_t *modifiers, uint32_t *bo_handles, MMAL_ES_FORMAT_T *format)
 {
    switch (format->encoding)
    {
@@ -279,14 +398,26 @@ void mmal_format_to_drm_pitches_offsets(uint32_t *pitches, uint32_t *offsets, ui
 
          bo_handles[1] = bo_handles[0];
          break;
+      case MMAL_ENCODING_YUVUV128:
+         pitches[0] = format->es->video.width;    //Should be 128, but DRM rejects that.
+         modifiers[0] = DRM_FORMAT_MOD_BROADCOM_VC4_SAND128_COL_HEIGHT(get_sand_column_pitch(format->es->video.height));
+         printf("Modifier set as %llu, param %llu\n", modifiers[0], param_from_vc4_mod(modifiers[0]));
+         modifiers[1] = modifiers[0];
+         pitches[1] = pitches[0];
+
+         offsets[1] = 128 * (format->es->video.height+32);  //ISP seems to produce an extra 16 lines of padding. Don't know why.
+
+         bo_handles[1] = bo_handles[0];
+         break;
       default:
          pitches[0] = mmal_encoding_width_to_stride(format->encoding, format->es->video.width);
          break;
    }
-   printf("MMAL format %08x translates to pitches [%u,%u,%u,%u], and offsets [%u,%u,%u,%u]\n",
+   printf("MMAL format %08x translates to pitches [%u,%u,%u,%u], offsets [%u,%u,%u,%u], and modifiers [%llx,%llx,%llx,%llx]\n",
             format->encoding,
             pitches[0],pitches[1],pitches[2],pitches[3],
-            offsets[0],offsets[1],offsets[2],offsets[3]
+            offsets[0],offsets[1],offsets[2],offsets[3],
+            modifiers[0],modifiers[1],modifiers[2],modifiers[3]
             );
 }
 
@@ -359,10 +490,11 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
 
    uint32_t offsets[4] = { 0 };
    uint32_t pitches[4] = { 0 };
+   uint64_t modifiers[4] = { 0 };
    uint32_t bo_handles[4] = { b->bo_handle };
    unsigned int fourcc = mmal_encoding_to_drm_fourcc(port->format->encoding);
 
-   mmal_format_to_drm_pitches_offsets(pitches, offsets, bo_handles, port->format);
+   mmal_format_to_drm_pitches_offsets(pitches, offsets, modifiers, bo_handles, port->format);
 
    fprintf(stderr, "FB fourcc %c%c%c%c\n",
       fourcc,
@@ -370,9 +502,9 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
       fourcc >> 16,
       fourcc >> 24);
 
-   ret = drmModeAddFB2(drmfd, port->format->es->video.crop.width,
+   ret = drmModeAddFB2WithModifiers(drmfd, port->format->es->video.crop.width,
       port->format->es->video.crop.height, fourcc, bo_handles,
-      pitches, offsets, &b->fb_handle, 0);
+      pitches, offsets, modifiers, &b->fb_handle, modifiers[0] ? DRM_MODE_FB_MODIFIERS : 0);
    if (ret)
    {
       printf("drmModeAddFB2 failed: %s\n", ERRSTR);
