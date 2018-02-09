@@ -1015,6 +1015,7 @@ int main(int argc, char **argv)
    CHECK_STATUS(status, "failed to commit format");
 
    MMAL_ES_FORMAT_T *format_out = decoder->output[0]->format;
+   mmal_format_copy(format_out, format_in);
    format_out->encoding = MMAL_ENCODING_OPAQUE;
 
    status = mmal_port_format_commit(decoder->output[0]);
