@@ -877,16 +877,32 @@ gl_setup(void)
    glEnableVertexAttribArray(0);
 }
 
+static double get_time(void)
+{
+    struct timespec tp;
+
+    clock_gettime(CLOCK_MONOTONIC, &tp);
+    return tp.tv_sec + (double)tp.tv_nsec / 1000000000;
+}
+
+static double start_time;
+static int frames;
+
 static void
 present_dmabuf(EGLDisplay dpy, EGLContext ctx, EGLSurface surf,
                struct buffer *buffer)
 {
+   if (!start_time)
+      start_time = get_time();
+
    glClearColor(0.5, 0.5, 0.5, 0.5);
    glClear(GL_COLOR_BUFFER_BIT);
 
    glBindTexture(GL_TEXTURE_EXTERNAL_OES, buffer->texture);
    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
    eglSwapBuffers(dpy, surf);
+
+   frames++;
 }
 
 static int
@@ -1101,8 +1117,15 @@ int main(int argc, char **argv)
 
       /* Wait for buffer headers to be available on either of the decoder ports */
       vcos_status = vcos_semaphore_wait_timeout(&context.semaphore, 2000);
-      if (vcos_status != VCOS_SUCCESS)
-         fprintf(stderr, "vcos_semaphore_wait_timeout failed - status %d\n", vcos_status);
+      if (vcos_status != VCOS_SUCCESS) {
+         double end_time = get_time();
+
+         fprintf(stdout, "%d frames in %f secs: %f FPS\n",
+                 frames,
+                 end_time - start_time,
+                 frames / (end_time - start_time));
+         exit(1);
+      }
 
       /* Check for errors */
       if (context.status != MMAL_SUCCESS)
