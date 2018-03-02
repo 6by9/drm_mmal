@@ -400,9 +400,9 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port,
    int i = 0;
 
    attribs[i++] = EGL_WIDTH;
-   attribs[i++] = port->format->es->video.width;
+   attribs[i++] = port->format->es->video.crop.width;
    attribs[i++] = EGL_HEIGHT;
-   attribs[i++] = port->format->es->video.height;
+   attribs[i++] = port->format->es->video.crop.height;
 
    attribs[i++] = EGL_LINUX_DRM_FOURCC_EXT;
    attribs[i++] = fourcc;
