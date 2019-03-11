@@ -1208,7 +1208,7 @@ int main(int argc, char **argv)
    fprintf(stderr, "start decoding\n");
 
    /* This is the main processing loop */
-   while(!eos_received && out_count < 10000)
+   while(!eos_received && out_count < 1000)
    {
       MMAL_BUFFER_HEADER_T *buffer;
       VCOS_STATUS_T vcos_status;
@@ -1380,6 +1380,14 @@ int main(int argc, char **argv)
          status = mmal_port_send_buffer(isp->output[0], buffer);
          CHECK_STATUS(status, "failed to send buffer to isp");
       }
+   }
+   {
+         double end_time = get_time();
+
+         fprintf(stdout, "%d frames in %f secs: %f FPS\n",
+                 frames,
+                 end_time - start_time,
+                 frames / (end_time - start_time));
    }
 
    /* Stop decoding */
