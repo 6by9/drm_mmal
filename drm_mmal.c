@@ -132,7 +132,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //MMAL_ENCODING_BGR24
 //Patches sorted for vc4_plane.c for each of these, and then they work.
 //
-#define ENCODING_FOR_DRM  MMAL_ENCODING_YV12
+#define ENCODING_FOR_DRM  MMAL_ENCODING_YUVUV128
 
 #define DRM_MODULE "vc4"
 #define MAX_BUFFERS 3
@@ -1137,7 +1137,7 @@ int main(int argc, char **argv)
     */
    int drmfd = get_drm_fd(setup.dpy);
 
-   vcsm_init();
+   vcsm_init_ex(1, -1);
 
    vcos_semaphore_create(&context.semaphore, "example", 1);
 
@@ -1264,7 +1264,7 @@ int main(int argc, char **argv)
    CHECK_STATUS(status, "failed to enable isp output port");
 
    make_window(setup.dpy, setup.egl_dpy, "mmal-demo",
-               0, 0, 800, 600, &setup.win, &setup.ctx, &setup.surf);
+               0, 0, 1280, 720, &setup.win, &setup.ctx, &setup.surf);
 
    gl_setup();
 
