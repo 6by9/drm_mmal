@@ -81,7 +81,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //MMAL_ENCODING_BGR24
 //Patches sorted for vc4_plane.c for each of these, and then they work.
 //
-#define ENCODING_FOR_DRM  MMAL_ENCODING_YUVUV128
+#define ENCODING_FOR_DRM  MMAL_ENCODING_I420 //YUVUV128
 
 #define DRM_MODULE "vc4"
 #define MAX_BUFFERS 3
@@ -367,11 +367,19 @@ void mmal_format_to_drm_pitches_offsets(uint32_t *pitches, uint32_t *offsets,
             );
 }
 
+#define BUFFER_IMPORT 0
 static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
 {
+   uint32_t offsets[4] = { 0 };
+   uint32_t pitches[4] = { 0 };
+   uint32_t bo_handles[4] = { 0 };
+   uint64_t modifiers[4] = { 0 };
+   unsigned int fourcc = mmal_encoding_to_drm_fourcc(port->format->encoding);
+   int ret;
+
+#if BUFFER_IMPORT
    struct drm_mode_create_dumb gem;
    struct drm_mode_destroy_dumb gem_destroy;
-   int ret;
 
    memset(&gem, 0, sizeof gem);
    gem.width = port->format->es->video.width;
@@ -400,11 +408,42 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
    printf("dbuf_fd = %d\n", prime.fd);
    b->dbuf_fd = prime.fd;
 
-   uint32_t offsets[4] = { 0 };
-   uint32_t pitches[4] = { 0 };
-   uint64_t modifiers[4] = { 0 };
-   uint32_t bo_handles[4] = { b->bo_handle };
-   unsigned int fourcc = mmal_encoding_to_drm_fourcc(port->format->encoding);
+   b->vcsm_handle = vcsm_import_dmabuf(b->dbuf_fd, "DRM Buf");
+   if (!b->vcsm_handle)
+      goto fail_prime;
+#else
+   b->vcsm_handle = vcsm_malloc(port->buffer_size, "DRM Buf");
+   if (!b->vcsm_handle)
+   {
+      printf("vcsm_malloc failed: %s\n", ERRSTR);
+      return -1;
+   }
+
+   b->dbuf_fd = vcsm_export_dmabuf(b->vcsm_handle);
+   if (b->dbuf_fd < 0)
+   {
+      printf("vcsm_export failed: %s\n", ERRSTR);
+      goto fail_vcsm;
+   }
+
+   //struct drm_prime_handle prime;
+   //memset(&prime, 0, sizeof prime);
+   //prime.fd = b->dbuf_fd;
+
+   //ret = ioctl(drmfd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &prime);
+   ret = drmPrimeFDToHandle(drmfd, b->dbuf_fd, &b->bo_handle);
+   if (ret)
+   {
+      printf("DRM_IOCTL_PRIME_FD_TO_HANDLE failed: %s\n", ERRSTR);
+      goto fail_unexport;
+   }
+   //b->bo_handle = prime.handle;
+   printf("prime_bo = %d\n", b->bo_handle);
+
+
+#endif
+
+   bo_handles[0] = b->bo_handle;
 
    mmal_format_to_drm_pitches_offsets(pitches, offsets, modifiers, bo_handles, port->format);
 
@@ -414,10 +453,6 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
       fourcc >> 16,
       fourcc >> 24);
 
-   b->vcsm_handle = vcsm_import_dmabuf(b->dbuf_fd, "DRM Buf");
-   if (!b->vcsm_handle)
-      goto fail_prime;
-
    ret = drmModeAddFB2WithModifiers(drmfd, port->format->es->video.crop.width,
 //   ret = drmModeAddFB2(drmfd, port->format->es->video.crop.width,
       port->format->es->video.crop.height, fourcc, bo_handles,
@@ -426,14 +461,14 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
    if (ret)
    {
       printf("drmModeAddFB2 failed: %s\n", ERRSTR);
-      goto fail_vcsm;
+      goto fail_all;
    }
 
    return 0;
 
-fail_vcsm:
+fail_all:
+#if BUFFER_IMPORT
    vcsm_free(b->vcsm_handle);
-
 fail_prime:
    close(b->dbuf_fd);
 
@@ -445,6 +480,22 @@ fail_gem:
    {
       printf("DESTROY_DUMB failed: %s\n", ERRSTR);
    }
+#else
+fail_free_all:
+   {
+      //How do I release the PRIME_FD_TO_HANDLE handle? Is it this?
+      struct drm_gem_close gem_close;
+
+      memset(&gem_close, 0, sizeof gem_close);
+      gem_close.handle = b->bo_handle;
+      if (drmIoctl(drmfd, DRM_IOCTL_GEM_CLOSE, &gem_close) < 0)
+         printf("cant close gem: %s\n", strerror(errno));
+   }
+fail_unexport:
+   close(b->dbuf_fd);
+fail_vcsm:
+   vcsm_free(b->vcsm_handle);
+#endif
 
    return -1;
 }
@@ -473,6 +524,7 @@ MMAL_POOL_T* pool_create_drm(MMAL_PORT_T *port, struct buffer *buffers, int drmf
 
 void buffer_destroy(int drmfd, struct buffer *buf)
 {
+#if BUFFER_IMPORT
    struct drm_mode_destroy_dumb gem_destroy;
 
    vcsm_free(buf->vcsm_handle);
@@ -482,6 +534,20 @@ void buffer_destroy(int drmfd, struct buffer *buf)
    memset(&gem_destroy, 0, sizeof gem_destroy);
    gem_destroy.handle = buf->bo_handle;
    ioctl(drmfd, DRM_IOCTL_MODE_DESTROY_DUMB, &gem_destroy);
+#else
+   //How do I release the PRIME_FD_TO_HANDLE handle? Is it this?
+   {
+      struct drm_gem_close gem_close;
+
+      memset(&gem_close, 0, sizeof gem_close);
+      gem_close.handle = buf->bo_handle;
+      if (drmIoctl(drmfd, DRM_IOCTL_GEM_CLOSE, &gem_close) < 0)
+         printf("cant close gem: %s\n", strerror(errno));
+   }
+   
+   close(buf->dbuf_fd);
+   vcsm_free(buf->vcsm_handle);
+#endif
 }
 
 void pool_destroy_drm(MMAL_PORT_T *port, MMAL_POOL_T *pool, struct buffer *buffers, int drmfd)
@@ -768,7 +834,7 @@ int main(int argc, char **argv)
    int drmfd = drmOpen(DRM_MODULE, NULL);
    CHECK_CONDITION(drmfd < 0, "drmOpen(%s) failed: %s\n", DRM_MODULE, ERRSTR);
 
-   vcsm_init();
+   vcsm_init_ex(1, -1);
 
    vcos_semaphore_create(&context.semaphore, "example", 1);
 
