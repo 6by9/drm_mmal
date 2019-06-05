@@ -84,7 +84,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define ENCODING_FOR_DRM  MMAL_ENCODING_I420 //YUVUV128
 
 #define DRM_MODULE "vc4"
-#define MAX_BUFFERS 3
+#define MAX_BUFFERS 5
 
 static inline int warn(const char *file, int line, const char *fmt, ...)
 {
@@ -818,7 +818,7 @@ int main(int argc, char **argv)
    MMAL_BOOL_T eos_sent = MMAL_FALSE, eos_received = MMAL_FALSE;
    struct drm_setup setup = {0};
    struct buffer buffers[MAX_BUFFERS];
-   MMAL_BUFFER_HEADER_T *current_buffer = NULL;
+   MMAL_BUFFER_HEADER_T *current_buffer = NULL, *previous_buffer = NULL, *prev_prev_buffer = NULL;
    MMAL_CONNECTION_T *connection = NULL;
    unsigned int in_count = 0, conn_out_count = 0, conn_in_count = 0, out_count = 0;
    int ret;
@@ -1130,8 +1130,13 @@ int main(int argc, char **argv)
             CHECK_CONDITION(ret, "drmModeSetPlane failed: %s\n", ERRSTR);
 
             //Release buffer that was on the screen
+            if (prev_prev_buffer)
+               mmal_buffer_header_release(prev_prev_buffer);
+            if (previous_buffer)
+               prev_prev_buffer = previous_buffer;
             if (current_buffer)
-               mmal_buffer_header_release(current_buffer);
+               previous_buffer = current_buffer;
+
             //Store pointer to the new buffer that is now on the screen
             current_buffer = buffer;
             out_count++;
