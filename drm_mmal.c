@@ -790,7 +790,7 @@ int main(int argc, char **argv)
    CHECK_STATUS(status, "failed to enable control port");
 
    /* Set the zero-copy parameter on the input port */
-   status = mmal_port_parameter_set_boolean(decoder->input[0], MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
+   status = mmal_port_parameter_set_boolean(decoder->input[0], MMAL_PARAMETER_ZERO_COPY, MMAL_FALSE);
    CHECK_STATUS(status, "failed to set zero copy - %s", decoder->input[0]->name);
 
    /* Set the zero-copy parameter on the output port */
