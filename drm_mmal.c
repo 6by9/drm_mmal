@@ -81,10 +81,10 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //MMAL_ENCODING_BGR24
 //Patches sorted for vc4_plane.c for each of these, and then they work.
 //
-#define ENCODING_FOR_DRM  MMAL_ENCODING_YUVUV128
+#define ENCODING_FOR_DRM  MMAL_ENCODING_I420 //YUVUV128
 
 #define DRM_MODULE "vc4"
-#define MAX_BUFFERS 6
+#define MAX_BUFFERS 5
 
 static inline int warn(const char *file, int line, const char *fmt, ...)
 {
@@ -348,7 +348,7 @@ void mmal_format_to_drm_pitches_offsets(uint32_t *pitches, uint32_t *offsets,
       case MMAL_ENCODING_YUVUV128:
          pitches[0] = format->es->video.width;    //Should be 128, but DRM rejects that.
          modifiers[0] = DRM_FORMAT_MOD_BROADCOM_SAND128_COL_HEIGHT(get_sand_column_pitch(format->es->video.height));
-         printf("Modifier set as %llx, param %u\n", modifiers[0], fourcc_mod_broadcom_param(modifiers[0]));
+         printf("Modifier set as %llu, param %u\n", modifiers[0], fourcc_mod_broadcom_param(modifiers[0]));
          modifiers[1] = modifiers[0];
          pitches[1] = pitches[0];
 
@@ -456,7 +456,7 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
    ret = drmModeAddFB2WithModifiers(drmfd, port->format->es->video.crop.width,
 //   ret = drmModeAddFB2(drmfd, port->format->es->video.crop.width,
       port->format->es->video.crop.height, fourcc, bo_handles,
-      pitches, offsets, modifiers, &b->fb_handle, modifiers[0] ? DRM_MODE_FB_MODIFIERS : 0);
+      pitches, offsets, modifiers, &b->fb_handle, 0);
 //      pitches, offsets, &b->fb_handle, 0);
    if (ret)
    {
@@ -818,11 +818,9 @@ int main(int argc, char **argv)
    MMAL_BOOL_T eos_sent = MMAL_FALSE, eos_received = MMAL_FALSE;
    struct drm_setup setup = {0};
    struct buffer buffers[MAX_BUFFERS];
-   MMAL_BUFFER_HEADER_T *new_buffer = NULL, *new_new_buffer = NULL;
    MMAL_BUFFER_HEADER_T *current_buffer = NULL, *previous_buffer = NULL, *prev_prev_buffer = NULL;
    MMAL_CONNECTION_T *connection = NULL;
    unsigned int in_count = 0, conn_out_count = 0, conn_in_count = 0, out_count = 0;
-   unsigned int last_stc = 0;
    int ret;
 
    if (argc < 2)
@@ -1101,38 +1099,25 @@ int main(int argc, char **argv)
          else
          {
             int index;
-MMAL_BUFFER_HEADER_T *display_buffer = NULL;
-unsigned int stc = vcos_getmicrosecs();
-            fprintf(stderr, "decoded frame (flags %x) count %d, STC %u, delta %u\n", buffer->flags, out_count, stc, stc-last_stc);
-last_stc = stc;
-if (new_new_buffer)
-	display_buffer = new_new_buffer;
-if(new_buffer)
-	new_new_buffer = new_buffer;
-if (buffer)
-	new_buffer = buffer;
-   
 
-            if (display_buffer)
+            //fprintf(stderr, "decoded frame (flags %x) count %d\n", buffer->flags, out_count);
+            if (buffer)
             {
                unsigned int i;
                for (i = 0; i < pool_out->headers_num; i++) {
-                  if (buffers[i].mmal_buffer == display_buffer) {
+                  if (buffers[i].mmal_buffer == buffer) {
                      //printf("Matches buffer index %u\n", i);
                      index = i;
                      break;
                   }
                }
                if (i == pool_out->headers_num) {
-                  printf("Failed to find matching buffer for mmal buffer %p\n", display_buffer);
+                  printf("Failed to find matching buffer for mmal buffer %p\n", buffer);
                   continue;
                }
             }
             else
-            {
                continue;
-            }
-
 
             ret = drmModeSetPlane(drmfd, setup.planeId, setup.crtcId,
                         buffers[index].fb_handle, 0,
@@ -1145,19 +1130,16 @@ if (buffer)
             CHECK_CONDITION(ret, "drmModeSetPlane failed: %s\n", ERRSTR);
 
             //Release buffer that was on the screen
-//            if (prev_prev_buffer)
+            if (prev_prev_buffer)
+               mmal_buffer_header_release(prev_prev_buffer);
+            if (previous_buffer)
+               prev_prev_buffer = previous_buffer;
             if (current_buffer)
-               mmal_buffer_header_release(current_buffer);
-//               mmal_buffer_header_release(prev_prev_buffer);
-//            if (previous_buffer)
-//               prev_prev_buffer = previous_buffer;
-//            if (current_buffer)
-//               prev_prev_buffer = current_buffer;
+               previous_buffer = current_buffer;
 
             //Store pointer to the new buffer that is now on the screen
             current_buffer = buffer;
             out_count++;
-            //vcos_sleep(50);
          }
       }
 
