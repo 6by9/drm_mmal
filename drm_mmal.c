@@ -81,7 +81,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //MMAL_ENCODING_BGR24
 //Patches sorted for vc4_plane.c for each of these, and then they work.
 //
-#define ENCODING_FOR_DRM  MMAL_ENCODING_I420 //YUVUV128
+#define ENCODING_FOR_DRM  MMAL_ENCODING_YUVUV128
 
 #define DRM_MODULE "vc4"
 #define MAX_BUFFERS 5
@@ -456,7 +456,7 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
    ret = drmModeAddFB2WithModifiers(drmfd, port->format->es->video.crop.width,
 //   ret = drmModeAddFB2(drmfd, port->format->es->video.crop.width,
       port->format->es->video.crop.height, fourcc, bo_handles,
-      pitches, offsets, modifiers, &b->fb_handle, 0);
+      pitches, offsets, modifiers, &b->fb_handle, modifiers[0] ? DRM_MODE_FB_MODIFIERS : 0);
 //      pitches, offsets, &b->fb_handle, 0);
    if (ret)
    {
