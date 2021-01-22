@@ -51,6 +51,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <drm.h>
 #include <drm_mode.h>
+#include <drm_fourcc.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
@@ -80,7 +81,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //MMAL_ENCODING_BGR24
 //Patches sorted for vc4_plane.c for each of these, and then they work.
 //
-#define ENCODING_FOR_DRM  MMAL_ENCODING_I420
+#define ENCODING_FOR_DRM  MMAL_ENCODING_YUVUV128
 
 #define DRM_MODULE "vc4"
 #define MAX_BUFFERS 3
@@ -221,6 +222,7 @@ uint32_t mmal_encoding_to_drm_fourcc(uint32_t mmal_encoding)
          return MMAL_FOURCC('Y','V','1','2');
       case MMAL_ENCODING_I422:
          return MMAL_FOURCC('Y','U','1','6');
+      case MMAL_ENCODING_YUVUV128:
       case MMAL_ENCODING_NV12:
          return MMAL_FOURCC('N','V','1','2');
       case MMAL_ENCODING_NV21:
@@ -244,7 +246,8 @@ uint32_t mmal_encoding_to_drm_fourcc(uint32_t mmal_encoding)
    }
 }
 
-void mmal_format_to_drm_pitches_offsets(uint32_t *pitches, uint32_t *offsets, uint32_t *bo_handles, MMAL_ES_FORMAT_T *format)
+void mmal_format_to_drm_pitches_offsets(uint32_t *pitches, uint32_t *offsets,
+		uint64_t *modifiers, uint32_t *bo_handles, MMAL_ES_FORMAT_T *format)
 {
    switch (format->encoding)
    {
@@ -277,6 +280,17 @@ void mmal_format_to_drm_pitches_offsets(uint32_t *pitches, uint32_t *offsets, ui
          pitches[1] = pitches[0];
 
          offsets[1] = pitches[0] * format->es->video.height;
+
+         bo_handles[1] = bo_handles[0];
+         break;
+      case MMAL_ENCODING_YUVUV128:
+         pitches[0] = format->es->video.width;    //Should be 128, but DRM rejects that.
+         modifiers[0] = DRM_FORMAT_MOD_BROADCOM_SAND128_COL_HEIGHT(format->es->video.width);
+         printf("Modifier set as %llu, param %u\n", modifiers[0], fourcc_mod_broadcom_param(modifiers[0]));
+         modifiers[1] = modifiers[0];
+         pitches[1] = pitches[0];
+
+         offsets[1] = 128 * (format->es->video.height);
 
          bo_handles[1] = bo_handles[0];
          break;
@@ -327,9 +341,10 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
    uint32_t offsets[4] = { 0 };
    uint32_t pitches[4] = { 0 };
    uint32_t bo_handles[4] = { b->bo_handle };
+   uint64_t modifiers[4] = { 0 };
    unsigned int fourcc = mmal_encoding_to_drm_fourcc(port->format->encoding);
 
-   mmal_format_to_drm_pitches_offsets(pitches, offsets, bo_handles, port->format);
+   mmal_format_to_drm_pitches_offsets(pitches, offsets, modifiers, bo_handles, port->format);
 
    fprintf(stderr, "FB fourcc %c%c%c%c\n",
       fourcc,
@@ -341,9 +356,9 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
    if (!b->vcsm_handle)
       goto fail_prime;
 
-   ret = drmModeAddFB2(drmfd, port->format->es->video.crop.width,
+   ret = drmModeAddFB2WithModifiers(drmfd, port->format->es->video.crop.width,
       port->format->es->video.crop.height, fourcc, bo_handles,
-      pitches, offsets, &b->fb_handle, 0);
+      pitches, offsets, modifiers, &b->fb_handle, DRM_MODE_FB_MODIFIERS);
    if (ret)
    {
       printf("drmModeAddFB2 failed: %s\n", ERRSTR);
@@ -382,7 +397,7 @@ MMAL_POOL_T* pool_create_drm(MMAL_PORT_T *port, struct buffer *buffers, int drmf
    for (i = 0; i < port->buffer_num; i++)
    {
       buffer_create(&buffers[i], drmfd, port);
-      
+
       pool->header[i]->data = (uint8_t*)vcsm_vc_hdl_from_hdl(buffers[i].vcsm_handle);
       pool->header[i]->alloc_size = port->buffer_size;
       pool->header[i]->length = 0;
@@ -447,7 +462,7 @@ static int find_crtc(int drmfd, struct drm_setup *s, uint32_t *con)
    int ret = -1;
    int i;
    drmModeRes *res = drmModeGetResources(drmfd);
-   if(!res) 
+   if(!res)
    {
       printf( "drmModeGetResources failed: %s\n", ERRSTR);
       return -1;
@@ -805,6 +820,10 @@ int main(int argc, char **argv)
    isp->output[0]->userdata = (void *)&context;
    mmal_format_full_copy(isp->output[0]->format, isp->input[0]->format);
    isp->output[0]->format->encoding = ENCODING_FOR_DRM;
+   if (ENCODING_FOR_DRM == MMAL_ENCODING_YUVUV128) {
+      isp->output[0]->format->flags |= MMAL_ES_FORMAT_FLAG_COL_FMTS_WIDTH_IS_COL_STRIDE;
+      isp->output[0]->format->es->video.width = ((isp->output[0]->format->es->video.height*3)/2);
+   }
 
    status = mmal_port_format_commit(isp->output[0]);
    CHECK_STATUS(status, "failed to set ISP output format");
@@ -890,6 +909,11 @@ int main(int argc, char **argv)
                isp->output[0]->format->encoding = ENCODING_FOR_DRM;
                isp->output[0]->buffer_num = MAX_BUFFERS;
                isp->output[0]->buffer_size = isp->output[0]->buffer_size_min;
+               if (ENCODING_FOR_DRM == MMAL_ENCODING_YUVUV128)
+               {
+                  isp->output[0]->format->flags |= MMAL_ES_FORMAT_FLAG_COL_FMTS_WIDTH_IS_COL_STRIDE;
+                  isp->output[0]->format->es->video.width = ((isp->output[0]->format->es->video.height*3)/2);
+               }
 
                if (status == MMAL_SUCCESS)
                   status = mmal_port_format_commit(isp->output[0]);
